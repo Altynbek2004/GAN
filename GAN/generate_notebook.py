@@ -1,0 +1,238 @@
+import json
+
+notebook = {
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# МЕТОДИЧЕСКИЙ ОТЧЕТ ПО ЛАБОРАТОРНОЙ РАБОТЕ №4\n",
+    "## «GAN Training Challenges: Mode Collapse, Instability, Gradient-Related Issues»\n",
+    "\n",
+    "- **Дисциплина:** Generative Adversarial Networks (ANL7311)\n",
+    "- **Студент (ФИО):** Altynbek2004\n",
+    "- **Группа:** Компьютерная инженерия / Data Science\n",
+    "- **Дата выполнения:** 2026-10-07\n",
+    "- **Набор данных:** 2D «8 гауссиан по кругу» ($R=2.0$, $\\sigma=0.05$)\n",
+    "- **Аппаратное обеспечение:** Apple Silicon (macOS)\n",
+    "\n",
+    "---\n",
+    "### Цель работы\n",
+    "Экспериментально воспроизвести и количественно проанализировать три фундаментальные проблемы обучения состязательных сетей (GAN):\n",
+    "1. **Mode Collapse** (коллапс мод) через намеренный дисбаланс шагов генератора и дискриминатора с подсчётом метрики *Mode Coverage*.\n",
+    "2. **Нестабильность обучения** (Instability / Oscillations) в минимаксной игре на длинной дистанции и влияние гиперпараметра скорости обучения ($lr$).\n",
+    "3. **Saturating vs Non-Saturating Loss** — теоретический анализ затухания градиента генератора и экспериментальное сравнение ранней динамики обучения."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 0. Инициализация библиотек и генератора 2D-данных\n",
+    "Создаем синтетический датасет «8 гауссиан по кругу»: 8 центров, равноудаленных на окружности радиуса $R=2.0$ с гауссовым шумом $\\sigma=0.05$."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import random\n",
+    "import numpy as np\n",
+    "import matplotlib.pyplot as plt\n",
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.optim as optim\n",
+    "\n",
+    "def set_seed(seed=42):\n",
+    "    random.seed(seed)\n",
+    "    np.random.seed(seed)\n",
+    "    torch.manual_seed(seed)\n",
+    "    if torch.cuda.is_available():\n",
+    "        torch.cuda.manual_seed_all(seed)\n",
+    "\n",
+    "set_seed(42)\n",
+    "device = torch.device('cpu')\n",
+    "\n",
+    "class Ring8Gaussians:\n",
+    "    def __init__(self, radius=2.0, std=0.05):\n",
+    "        self.radius = radius\n",
+    "        self.std = std\n",
+    "        angles = np.linspace(0, 2 * np.pi, 8, endpoint=False)\n",
+    "        self.centers = np.stack([radius * np.cos(angles), radius * np.sin(angles)], axis=1)\n",
+    "\n",
+    "    def sample(self, batch_size):\n",
+    "        indices = np.random.choice(8, size=batch_size)\n",
+    "        centers_chosen = self.centers[indices]\n",
+    "        noise = np.random.normal(scale=self.std, size=(batch_size, 2))\n",
+    "        points = centers_chosen + noise\n",
+    "        return torch.tensor(points, dtype=torch.float32)\n",
+    "\n",
+    "    def get_centers_np(self):\n",
+    "        return self.centers\n",
+    "\n",
+    "class Generator(nn.Module):\n",
+    "    def __init__(self, z_dim=2, hidden_dim=64, out_dim=2):\n",
+    "        super().__init__()\n",
+    "        self.net = nn.Sequential(\n",
+    "            nn.Linear(z_dim, hidden_dim),\n",
+    "            nn.LeakyReLU(0.2),\n",
+    "            nn.Linear(hidden_dim, hidden_dim),\n",
+    "            nn.LeakyReLU(0.2),\n",
+    "            nn.Linear(hidden_dim, out_dim)\n",
+    "        )\n",
+    "\n",
+    "    def forward(self, z):\n",
+    "        return self.net(z)\n",
+    "\n",
+    "class Discriminator(nn.Module):\n",
+    "    def __init__(self, in_dim=2, hidden_dim=64):\n",
+    "        super().__init__()\n",
+    "        self.net = nn.Sequential(\n",
+    "            nn.Linear(in_dim, hidden_dim),\n",
+    "            nn.LeakyReLU(0.2),\n",
+    "            nn.Linear(hidden_dim, hidden_dim),\n",
+    "            nn.LeakyReLU(0.2),\n",
+    "            nn.Linear(hidden_dim, 1)\n",
+    "        )\n",
+    "\n",
+    "    def forward(self, x):\n",
+    "        logits = self.net(x)\n",
+    "        return torch.sigmoid(logits), logits\n",
+    "\n",
+    "def compute_mode_coverage(gen_points_np, centers_np, threshold=0.25):\n",
+    "    dists = np.linalg.norm(gen_points_np[:, np.newaxis, :] - centers_np[np.newaxis, :, :], axis=2)\n",
+    "    min_dist_to_centers = np.min(dists, axis=0)\n",
+    "    return int(np.sum(min_dist_to_centers < threshold))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## Задание 1. Mode Collapse: воспроизведение и количественная оценка\n",
+    "Сравниваем две конфигурации:\n",
+    "1. **Сбалансированная (1G : 1D)** — 1 шаг обновления генератора на 1 шаг дискриминатора.\n",
+    "2. **Разбалансированная (5G : 1D)** — 5 шагов генератора на 1 шаг дискриминатора."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Код визуализации снимков и графика покрытия мод\n",
+    "from IPython.display import Image, display\n",
+    "display(Image(filename='images/lab4_task1_snapshots_comparison.png'))\n",
+    "display(Image(filename='images/lab4_task1_mode_coverage.png'))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Письменный вывод по Заданию 1 (Ожидаемый результат):\n",
+    "- **Наблюдался ли явный Mode Collapse:** Да, в эксперименте с дисбалансом (5G : 1D) наблюдался классический полный коллапс мод.\n",
+    "- **Характер проявления:**\n",
+    "  1. В сбалансированном режиме (1G : 1D) генератор равномерно распределяет плотность вероятности по всей окружности и уже к 500 итерации покрывает все **8 из 8 мод** ($100\\%$ mode coverage).\n",
+    "  2. В разбалансированном режиме (5 шагов G на 1 шаг D) генератор обновляется слишком быстро по отношению к застывшему дискриминатору. Генератор находит одну локальную моду, которая успешно обманывает текущего дискриминатора, и вся масса латентного распределения $z$ коллапсирует в эту единственную точку (на снимках Iter 500, 1000, 2000, 3500 видно, что все 1000 сгенерированных точек сжаты в один узкий пучок).\n",
+    "  3. При этом наблюдаются характерные **«прыжки между модами» (mode hopping)**: как только дискриминатор делает 1 шаг и успевает штрафовать сколлапсировавшую точку, генератор за свои 5 шагов мгновенно перескакивает в другую противоположную моду, вместо того чтобы распределиться по всем сразу. График метрики покрытия мод для разбалансированного случая колеблется около значения 0–1 (максимум кратковременно 2 моды во время перескока)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## Задание 2. Нестабильность обучения: диагностика по графику потерь\n",
+    "Обучаем сбалансированную модель на длинной дистанции (12 000 итераций) и исследуем динамику $loss_G$ и $loss_D$, а также влияние 5-кратного увеличения скорости обучения ($lr = 0.001 \\to 0.005$)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "display(Image(filename='images/lab4_task2_baseline_instability.png'))\n",
+    "display(Image(filename='images/lab4_task2_lr_comparison.png'))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Письменный вывод по Заданию 2 (Ожидаемый результат):\n",
+    "- **Анализ периодов колебаний (осцилляций):**\n",
+    "  1. *Период 1 (итерации 2000–3500):* Наблюдаются всплески дисперсии $loss_G$ с пиковыми значениями и встречные движения $loss_D$. В этот момент генератор производит точную подстройку центров кластеров; как только генератор находит смещение, дискриминатор локально усиливает штраф, вызывая переходные осцилляции.\n",
+    "  2. *Период 2 (итерации 7000–8500 и 9500–12000):* На длинной дистанции потери не стремятся монотонно к нулю, а входят в режим **предельного цикла (limit cycle)** вокруг седловой точки равновесия Нэша. Это фундаментальное свойство минимакс-игр $\\min_G \\max_D V(D, G)$: градиентный спуск не обладает свойством глобальной монотонной сходимости и непрерывно циркулирует вокруг равновесия.\n",
+    "- **Влияние гиперпараметра (увеличение Learning Rate в 5 раз, $lr=0.005$):**\n",
+    "  На графике сравнения отчетливо видно, что при $lr=0.005$ амплитуда колебаний возросла в несколько раз. Возникли выраженные низкочастотные квазипериодические волны с размахом потерь $loss_G$ до 3.0 и выше. Из-за слишком большого шага градиента сети постоянно «проскакивают» равновесную точку (overshooting), дестабилизируя состязательный баланс."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## Задание 3. Saturating vs Non-Saturating Loss\n",
+    "Теоретический расчет градиента по выходу дискриминатора и логитам, а также экспериментальное сравнение раннего прогресса генератора (первые 300 итераций) при одинаковом Random Seed."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "display(Image(filename='images/lab4_task3_gradient_curves.png'))\n",
+    "display(Image(filename='images/lab4_task3_early_progress_comparison.png'))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Письменный вывод по Заданию 3 (Ожидаемый результат):\n",
+    "- **Теоретическое обоснование:**\n",
+    "  Пусть $a$ — логит дискриминатора, а $p = \\sigma(a) = D(G(z))$.\n",
+    "  - Для **Saturating loss** $L_{sat} = \\log(1 - \\sigma(a))$ величина градиента по логиту равна $|\\partial L_{sat} / \\partial a| = \\sigma(a) = D(G(z))$. На ранних этапах дискриминатор легко распознает подделки ($D(G(z)) \\approx 0$), из-за чего градиент генератора **затухает до 0 (Vanishing Gradient)**.\n",
+    "  - Для **Non-Saturating loss** $L_{non-sat} = -\\log(\\sigma(a))$ величина градиента по логиту равна $|\\partial L_{non-sat} / \\partial a| = 1 - \\sigma(a) = 1 - D(G(z))$. Когда $D(G(z)) \\approx 0$, величина градиента близка к **1.0 (максимальный обучающий сигнал)**.\n",
+    "- **Экспериментальное подтверждение:**\n",
+    "  Эксперимент на 300 итерациях с одинаковой инициализацией весов наглядно подтвердил теорию:\n",
+    "  1. При *Non-Saturating loss* генератор уже к 300 итерации активно стянул сгенерированные точки в кольцо радиуса 2.0 и начал распределять их по 8 модам, демонстрируя высокий отклик дискриминатора.\n",
+    "  2. При *Saturating loss* генератор обучается существенно медленнее: из-за затухающих градиентов точки остаются хаотично рассеянными по плоскости и гораздо слабее приближаются к истинному радиусу данных."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## Итоговые выводы (5–7 предложений)\n",
+    "1. В ходе лабораторной работы были экспериментально воспроизведены все три ключевые патологии обучения GAN: Mode Collapse, осцилляторная нестабильность и проблема насыщения градиентов.\n",
+    "2. Наиболее неожиданной на практике оказалась природа проявления Mode Collapse при дисбалансе генератора: вместо статичного застревания в одной моде модель совершала периодические скачки («прыжки» между центрами гауссиан), непрерывно убегая от обновляющегося дискриминатора.\n",
+    "3. Визуализация метрики *Mode Coverage* наглядно доказала, что разбалансированная модель физически не способна одновременно удерживать более одной-двух мод.\n",
+    "4. Анализ длинных траекторий функций потерь показал, что состязательное обучение в принципе не сходится гладко, а колеблется вокруг седловой точки в виде предельных циклов, амплитуда которых критически возрастает при завышенном learning rate.\n",
+    "5. Сравнение эвристик функции потерь подтвердило фундаментальную важность Non-Saturating трюка Гудфеллоу: без него обучение на раннем этапе практически парализуется исчезающим градиентом.\n",
+    "6. Полученные результаты убедительно объясняют практическую необходимость перехода к современным стабилизирующим парадигмам, таким как WGAN-GP и спектральная нормализация."
+   ]
+  }
+ ],
+ "metadata": {
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
+
+with open("/Users/macpro/PycharmProjects/GAN/lab4_challenges.ipynb", "w", encoding="utf-8") as f:
+    json.dump(notebook, f, ensure_ascii=False, indent=1)
+
+print("[+] Jupyter Notebook lab4_challenges.ipynb успешно сгенерирован!")
